@@ -1,0 +1,185 @@
+---
+title: "Purrr: Using functional programming on nested data in the tidyverse"
+author: "Jacob Weverka"
+date: "12/17/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(here)
+library(broom)
+library(modelr)
+
+```
+
+
+
+
+# Using `purrr` to apply functions to grouped data
+
+Sometimes we work with complex data that has a nested structure and that doesn't fall neatly into our concept of "tidy" data. I have found the `purrr` package (part of the tidyverse) to be very helpful in some of these cases.
+
+The example shown here is from a lab procedure where I measured the concentration of ammonium in solutions on a plate reader. The solutions were put in 96-well plates, treated with some chemicals, and then the absorbance of light at 660nm was recorded (more absorbance = more ammonium). Solutions with known concentrations of ammonium were placed in one row, to generate a standard curve. The plate reader returns this data in an unlabeled 8x12 grid in a CSV. I ran several of these plates, and thus have several CSV files, which are located in the subdirectory data/plate_reader_raw, each with a unique file name that includes the date it was taken. In separate CSVs, I recorded which sample or standard was at each position on each plate. These data are located in the subdirectory data/plate_reader_id
+
+Code plan:
+
+1. Read all CSV files into R
+
+2. Attach identifying information for each file
+
+3. Generate a separate standard curve for each file
+
+4. Use standard curve to calculate concentration values for samples
+
+5. Convert sample concentrations into tidy format for analysis
+
+
+
+
+
+### Using `read_csv` with `map` to read in a folder full of CSV files
+
+You are probably familiar with `read_csv`, but what if you have a bunch of files. You can generate a list of filenames in a subdirectory with `list.files()`. Then you can use the `purrr::map()` to read those files into nested tibble.
+
+
+
+1. Bring in filenames for raw data and id data
+```{r}
+
+raw_filenames = list.files(here("data", "plate_reader_raw"))
+
+id_filenames = list.files(here("data", "plate_reader_id"))
+
+```
+
+
+Now, we use `map` with `read_csv` to read in all files. There are two main arguments for `map`. The first argument `.x` is a list or a vector. The second argument, `.f` is a function to apply across that list or vector. `map` always returns a list (though there are variants like `map_int` or `map_chr` that can return atomic vectors).
+
+
+Here, I'm creating a tibble with a column named filename that contains the list of filenames we generated above. Then I'm using `mutate` to create a second column named "contents" to contain the output of `map`. In this column, each element contains a nested dataframe, read from each CSV in the directory we chose. In this example, `.x` is the filename column, and `.f` is a the function `read_csv` with arguments specified. Notice, I put the character `~` before the function, which designates the code afterward as a formula, and allows me to refer back to `.x` like an object.  I'll also add a third column that extracts the date from the filename.
+
+```{r message=FALSE}
+
+ammonium_files = tibble(filename = raw_filenames) %>%
+  mutate(contents = map(.x = filename,
+                        .f = ~ read_csv(file.path(here("data", "plate_reader_raw"), .x), col_types = cols())
+                        )
+         ) %>% 
+    mutate(date = lubridate::ymd(str_sub(filename, -13, -6)))
+
+
+```
+
+This code should return a tibble with two columns, but the second column should contain nested dataframes. You can click on these in the R studio viewer to examine them individually, or call them with double brackets like so: `ammonium_files[[2]][[1]]`.
+
+
+Now we'll do the same thing with the ID data.
+
+```{r message = FALSE}
+id_files = tibble(filename = id_filenames) %>%
+  mutate(id_files = map(filename, 
+                     ~ read_csv(file.path(here("data", "plate_reader_id"), .x), col_types = cols())
+                     )
+         ) %>%
+  mutate(date = lubridate::ymd(str_sub(filename, -12, -5))) # add a date column
+  
+```
+
+Now lets join them so we can work in a single tibble.
+
+```{r}
+ammonium = ammonium_files %>% 
+  left_join(id_files, by = "date")
+```
+
+## Manipulating data inside nested dataframes
+
+We will want to match our raw data to our id data, but within the nested tibbles, it is still not in a usable format. We need to make it longer so that we can match it using the "position" column in the id data. First, I'll overwrite the "contents" column to get rid of some extras. Then I'll create a new column that pulls the data in our 8x12 matrices into a single vector and puts it in a nested tibble with a position column to label it. Again, we will use `map` inside of `mutate` to do this.
+
+
+
+```{r}
+a = ammonium %>% 
+  mutate(contents = map(contents,  ## get rid of the non-data column
+                        ~ .x %>%
+                          column_to_rownames(var = "<>"))) %>% 
+  mutate(measured = map(contents, ## create new column that contains a tibble of labeled values
+                        ~ tibble(position = c(1:96), absorbance = as.vector(as.matrix(.x)))))
+```
+
+
+## Making multiple nested columns work together
+
+If we want to use this method on two columns, we can use `map2`. For more, you can use `pmap`. Here we will use `map2`. It contains three main arguments, `.x`, `.y`, and `.f`. It works like `map` except that `.y` now refers to a second list or vector.
+
+We need to first filter the id samples so they contain only the ids for the plate in that row. We'll start by pulling the plate ID from the filename then using `filter` with `map2`.
+
+Then we'll use `map2` with `left_join` to match the data to it's identifying information
+
+
+```{r}
+
+amm = a %>% 
+  mutate(plate_id = str_sub(filename.x, 1, -5)) %>% 
+  mutate(id_filtered = map2(.x = id_files, # filter plate ID data so it only contains relevant plates
+                            .y = plate_id,
+                            ~ filter(.x, ammonium_id == .y)
+                            )
+  ) %>% 
+  mutate(samples = map2(id_files, measured, # join plate ID data to measurements
+                        ~ .x %>% left_join(.y, by = "position"))
+         )
+
+```
+
+Now you have a new column with nested tibbles, where identifying information has been added to absorbance
+
+## Using purr functions to work with generate lists of other types of objects
+
+Now that we've put identifying information together, we can start analyzing it. Each plate needs its own standard curve for this assay, so we'll have to use the data identified as standards to build linear models for each row of data. We can do this with `map` as well
+
+The code here has two steps. First, I will use `map` with filter again to get standards alone. The I will use `map` with `lm` to generate standard curves. I will also use `broom::glance` to generate another column where I can easily check the fit of the standard curves.
+
+```{r}
+amm_sc = amm %>% 
+  mutate(standards = map(samples, # separate standards
+                         ~.x %>% filter(std == 1))
+         ) %>% 
+  mutate(standard_curve = map(standards,
+                              ~ lm(std_conc_NH4 ~ absorbance, data = .x))
+         ) %>% 
+  mutate(sc_glance = map(standard_curve, glance))
+```
+
+Now look at your tibble. There is a new column named "standard_curve" that contains lm objects
+
+We can use this standard curve to predict concentration values based on absorbances in our samples with `map2` and `modelr::add_predictions`. 
+
+```{r}
+
+amm_pred = amm_sc %>% 
+  mutate(samples = map2(samples, 
+                        standard_curve, ~ .x %>%
+                          add_predictions(.y)))
+```
+
+Look back at the data inside the "samples" column. It now has a new column named "pred" with ammonium concentrations predicted from the measured absorbance values and the standard curve.
+
+
+## Getting nested data back to tidy format
+
+Now that we've generated predictions and joined them with identifying format, it's time to return the data to an unnested, analyzable format. We can use `unnest` for this. Non-nested columns will be retained and multiplied in length so that they match the new, presumably longer dataframe.
+
+```{r}
+
+data_final = amm_pred %>% 
+  select(filename.x, samples) %>% 
+  unnest(samples)
+
+```
+
+Now you can do whatever you like with the data. Happy coding!
